@@ -5,7 +5,7 @@ This is my solution to an interview code challenge sent by a financial service c
 To view my solution (transformed into html page using knitr for better readability), please go to https://jonathanlxy.github.io/Code_Challenge_Loan_Delinquency/
 
 __Tools/packages used__: 
-- R (ggplot, data.table, dplyr, randomforest, rpart, rpart.plot, rattle, caTools)
+- R (ggplot, data.table, dplyr, randomForest, rpart, rpart.plot, rattle, caTools)
 
 ----
 

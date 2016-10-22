@@ -1,0 +1,231 @@
+---
+title: "Code Challenge"
+author: "Jonathan Liu"
+date: "October 3, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load file & packages
+
+```{r Load Data, message=FALSE}
+library(dplyr) # Data manipulation
+library(caTools) # Splitting
+# Decision tree
+library(rpart)
+library(rpart.plot)
+library(rattle)
+# Random forest
+library(randomForest)
+
+loan_data <- read.csv('LoanData.csv')
+loan_data$last_cleared_payment_date <- as.Date(loan_data$last_cleared_payment_date)
+```
+
+# Section 1
+
+- #### Sanitary check
+
+```{r summary}
+summary(loan_data)
+```
+
+#### Seems there are negative record(s) within __new_outstanding_principal_balance__, and 2 negative cases in __fico__ & __average_bank_balance\_\_c__ 
+
+----
+
+- #### Check outliers
+```{r check negative cases}
+# Check number of negative cases
+table(loan_data$new_outstanding_principal_balance < 0)
+```
+
+#### Only one negative record was found. It's safe to print out all outliers(2 NAs and 1 negative value) to check the pattern.
+
+```{r check outlier}
+filter(loan_data, !complete.cases(loan_data) | new_outstanding_principal_balance < 0)
+```
+
+----
+
+#### Through manual inspection, mssing values shows no special pattern. Given that those outliers are very minor cases, those two incomplete cases were dropped. The outlier with negative value seems like a extreme case and cannot be generalized in this analysis, therefore it was also dropped.
+``` {r drop_extreme}
+loan_data_clean <- filter(loan_data, 
+                          complete.cases(loan_data) & 
+                            new_outstanding_principal_balance >= 0)
+```
+
+----
+
+- #### Cut __days_delinquent_old__ and __days_delinquent_new__
+``` {r cut days}
+groups <- c(0, 1, 5, 10, 30, 60, Inf)
+cut_label <- c('0', '1-5', '5-10', '10-30', '30-60', '60+')
+de_groups_old <- cut(loan_data_clean$days_delinquent_old, 
+                     breaks = groups, 
+                     include.lowest = T, right = F,
+                     labels = cut_label)
+de_groups_new <- cut(loan_data_clean$days_delinquent_new, 
+                     breaks = groups, 
+                     include.lowest = T, right = F,
+                     labels = cut_label)
+```
+
+----
+
+## Make Transition Probability Matrix
+``` {r trans matrix}
+# Transition frequency matrix
+freq_mat <- table(de_groups_old, de_groups_new)
+# Devide frequencies by row sum to get transition probability matrix
+trans_mat <- freq_mat / rowSums(freq_mat)
+round(trans_mat, 2) ## Item (i, j) represents the probability of a loan's movement from group i to group j
+```
+
+----
+
+## Make Weighted Transition Probability Matrix
+``` {r weighted transition matrix}
+# Calculate sum(new_outstanding_principal_balance) for each group as weight
+groups_sum <- group_by(cbind(loan_data_clean, de_groups_old, de_groups_new), 
+                      de_groups_old, de_groups_new) %>% 
+  summarize(group_sum = sum(new_outstanding_principal_balance)) %>% 
+  xtabs(group_sum ~ de_groups_old + de_groups_new, data = .)
+# Multiply transition probabilities by weight to get weighted transition frequency matrix
+wt <- trans_mat * (groups_sum / rowSums(groups_sum))
+round(wt / rowSums(wt), 2) ## Item (i, j) represents the probability of movement from group i to group j, weighted by total outstanding principal balance for each group
+```
+
+----
+
+# Section 2
+#### The target is to distinguish loans whose delinquencies are likely to worsen from ones that are likely to improve, which means this should be considered as a classification problem (Regression on the changes in delinquent days is still doable, but since the actual delinquency count is discrete, thus it does not meet the assumption of regression algorithms). 
+
+#### There are three classes in this case (loans that improved, worsen, or unchanged), we need to consider how to deal with unchanged delinquencies.
+
+----
+
+- #### Check how many records has unchanged delinquency rates
+``` {r}
+table(loan_data_clean$days_delinquent_old != loan_data_clean$days_delinquent_new)
+```
+#### The unchanged group represents more than 20% of total records, it is quite risky to discard the unchanged records, because it will drop the information about this class, and cause the model to have high bias. Thus we need to keep this group, and logistic regression might not be a good choice for this problem because each logistic regression model can only do binary classification.
+
+----
+
+## Feature Engineering
+- #### 1. Using date variable is not a very good choice because it makes it harder to generalize the model. Therefore, the last payment date has been transformed into a new variable that indicates the number of days between the last payment date to current state (Nov. 1
+
+- #### 2. Initial loan amount and outstanding principal balance are by definition highly correlated. It can be transformed into a single variable, which indicates the payment amounts that have been made. 
+``` {r Feature Engineering}
+loan_data_labeled <- loan_data_clean %>%
+  mutate(delinquency_change = 'unchange') %>%
+  mutate(days_since_pay = as.integer(as.Date('2012-11-01') - last_cleared_payment_date)) %>%
+  mutate(paid_amount = initial_loan_amount - new_outstanding_principal_balance) %>%
+  select(-c(days_delinquent_new, as_of_date, last_cleared_payment_date,
+            initial_loan_amount, new_outstanding_principal_balance))
+
+de_change <- loan_data_clean$days_delinquent_old - loan_data_clean$days_delinquent_new
+loan_data_labeled$delinquency_change[de_change > 0] <- 'improve'
+loan_data_labeled$delinquency_change[de_change < 0] <- 'worsen'
+loan_data_labeled$delinquency_change <- as.factor(loan_data_labeled$delinquency_change)
+```
+
+----
+
+## 80/20 Splitting
+#### Split data into 80% training and 20% testing sets using stratified splitting based on target variable (change of delinquency)
+``` {r split}
+set.seed(1024)
+sp <- sample.split(loan_data_labeled$delinquency_change, SplitRatio = .8)
+```
+
+----
+
+## Majority voting benchmark
+#### By simply predicting the outcome of all loans as the most popular case, the prediction can reach 0.66 accuracy rate. Any model that scores worse than 0.66 would be considered useless. 
+``` {r benchmark}
+# Check distribution of target label
+voting <- table(loan_data_labeled$delinquency_change)
+# Accuracy rate by simply predicting majority label
+max(voting) / sum(voting)
+```
+
+----
+
+## Decision tree model
+#### The simple decision tree model can be easily interpreted, thus it was used as the first model. The max depth of this tree has been set to 3 to avoid overfitting
+- #### Train decision tree model & evaluate performance
+``` {r decision tree}
+loan.tree <- rpart(delinquency_change ~ ., 
+                   parms = list(split = 'gini'),
+                   control = list(maxdepth = 3),
+                   data = loan_data_labeled[sp, ])
+
+# Performance check - Training set
+pred.tree.train <- predict(loan.tree, newdata = loan_data_labeled[sp, ])
+pred.tree.train.label <- apply(pred.tree.train, 1, which.max)
+mean(pred.tree.train.label == as.integer(loan_data_labeled$delinquency_change[sp]))
+
+# Performance check - Testing set
+pred.tree.test <- predict(loan.tree, newdata = loan_data_labeled[!sp, ])
+pred.tree.test.label <- apply(pred.tree.test, 1, which.max)
+mean(pred.tree.test.label == as.integer(loan_data_labeled$delinquency_change[!sp]))
+```
+#### The simple decision tree has achieved around 75% accuracy rate in both training and testing sets
+
+----
+
+- #### Visualize & Interpret the model
+``` {r}
+loan.tree$variable.importance
+fancyRpartPlot(loan.tree)
+```
+
+#### It is very easy to interpret this decision tree model by following the splitting logic at each node. For example, if the loan has not been paid within 1 day, but not more than 195 days, it is likely to worsen; however, if the unpaid days has exceeded 195 days, it is likely to improve.
+
+----
+
+## Random Forest
+#### More advanced tree models tend to have better performances, but many of them require hyperparameter tuning, which is very time-consuming. Random Forest is known as having good "out of box" performance, which is ideal for this analysis. 
+``` {r rf-1}
+set.seed(42)
+rf <- randomForest(delinquency_change ~ ., data = loan_data_labeled[sp, ])
+
+# Visualize RF performance
+plot(rf)
+
+# Training set accuracy
+mean(predict(rf, newdata = loan_data_labeled[sp, ]) == loan_data_labeled$delinquency_change[sp])
+
+# Testing set accuracy
+mean(predict(rf, newdata = loan_data_labeled[!sp, ]) == loan_data_labeled$delinquency_change[!sp])
+
+```
+#### The initial RF model with default setting was severely overfitting with a 1.0 accuracy rate on the training set and 0.76 on testing set. Let's try increase nodesides to make the model more generalized
+
+``` {r rf-2}
+set.seed(42)
+rf <- randomForest(delinquency_change ~ ., data = loan_data_labeled[sp, ], 
+                   nodesize = 30)
+
+# Visualize RF performance
+plot(rf)
+
+# Training set accuracy
+mean(predict(rf, newdata = loan_data_labeled[sp, ]) == loan_data_labeled$delinquency_change[sp])
+
+# Testing set accuracy
+mean(predict(rf, newdata = loan_data_labeled[!sp, ]) == loan_data_labeled$delinquency_change[!sp])
+```
+#### The new model reached accuracy rate around 0.768, beat the simple decision tree by 0.02. This is not a major improvement, and it seems very hard to improve the accuracy rate of this model any further. This is very likely to be caused by the limited number of records available in this dataset.
+
+----
+
+## Conclusion
+#### Based on the analysis and statistical modeling, it seems the simple decision tree model has outperformed majority voting benchmark very well, and random forest did not significantly improve the prediction accuracy. Therefore, since Random Forest is much harder to interpret, and hyper-parameter tuning for Random Forest is time consuming, a simple decision tree model might be a better choice for this case analysis. 
+
+#### One possible solution to increase the Random Forest model accuracy is to collect more data for the modeling process. 
